@@ -1,0 +1,112 @@
+// =============================================================================
+// 03 - Wykrywanie wzorców ruchu i anomalii (Real-Time Intelligence / KQL)
+// =============================================================================
+// Metoda: series_decompose_anomalies() rozkłada szereg czasowy na trend +
+// sezonowość + reszty i flaguje punkty odstające. Baseline jest LICZONY PRZY
+// KAŻDYM URUCHOMIENIU na bieżącym oknie danych => model "uczy się" na żywo i
+// adaptuje do zmieniającego się ruchu (bez zarządzania zapisanym modelem).
+//
+// Parametry series_decompose_anomalies(series, threshold, seasonality, trend):
+//   threshold   - czułość (niżej = czulej; 1.5 to dobry start),
+//   seasonality - -1 = autodetekcja okresu sezonowego,
+//   trend       - 'linefit' usuwa trend liniowy przed detekcją.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// 1) WZORZEC RUCHU: wolumen żądań na minutę (z uwzględnieniem ItemCount/sampling)
+// -----------------------------------------------------------------------------
+AppRequests
+| where Timestamp > ago(1h)
+| make-series Requests = sum(ItemCount) default=0 on Timestamp step 1m
+| render timechart with(title="Wolumen żądań / min")
+
+// -----------------------------------------------------------------------------
+// 2) ANOMALIE WOLUMENU (skok/spadek ruchu) - wykres z podświetleniem anomalii
+// -----------------------------------------------------------------------------
+AppRequests
+| where Timestamp > ago(3h)
+| make-series Requests = sum(ItemCount) default=0 on Timestamp step 1m
+| extend (Anomalies, Score, Baseline) = series_decompose_anomalies(Requests, 1.5, -1, 'linefit')
+| render anomalychart with(anomalycolumns=Anomalies, title="Anomalie wolumenu ruchu")
+
+// -----------------------------------------------------------------------------
+// 3) ANOMALIE POZIOMU BŁĘDÓW (5xx/4xx) - udział błędów na minutę
+// -----------------------------------------------------------------------------
+AppRequests
+| where Timestamp > ago(3h)
+| extend IsError = iff(Success == false or toint(ResultCode) >= 500, 1, 0)
+| make-series Errors = sum(ItemCount * IsError) default=0,
+              Total  = sum(ItemCount)           default=0 on Timestamp step 1m
+| extend ErrorRate = series_divide(Errors, Total)
+| extend (Anomalies, Score, Baseline) = series_decompose_anomalies(ErrorRate, 1.5, -1, 'linefit')
+| render anomalychart with(anomalycolumns=Anomalies, title="Anomalie poziomu błędów")
+
+// -----------------------------------------------------------------------------
+// 4) ANOMALIE LATENCJI (p95) - na endpoint /api/checkout (najcięższy)
+// -----------------------------------------------------------------------------
+AppRequests
+| where Timestamp > ago(3h)
+| where OperationName has "checkout"
+| make-series P95 = percentile(DurationMs, 95) default=0 on Timestamp step 1m
+| extend (Anomalies, Score, Baseline) = series_decompose_anomalies(P95, 1.5, -1, 'linefit')
+| render anomalychart with(anomalycolumns=Anomalies, title="Anomalie latencji p95 (checkout)")
+
+// =============================================================================
+// FUNKCJE WIELOKROTNEGO UŻYTKU (do dashboardu i Activatora)
+// =============================================================================
+
+// Anomalie wolumenu jako WIERSZE (do alertów / Activatora). Zwraca tylko ostatnie
+// odchylenia w zadanym oknie. Activator może monitorować tę funkcję.
+.create-or-alter function with (folder="anomaly") VolumeAnomalies(lookback:timespan = 1h, step:timespan = 1m, sensitivity:real = 1.5) {
+    AppRequests
+    | where Timestamp > ago(lookback)
+    | make-series Requests = sum(ItemCount) default=0 on Timestamp step step
+    | extend (flags, score, baseline) = series_decompose_anomalies(Requests, sensitivity, -1, 'linefit')
+    | mv-expand Timestamp to typeof(datetime), Requests to typeof(long),
+                flags to typeof(int), score to typeof(real), baseline to typeof(real)
+    | where flags != 0
+    | project Timestamp, Metric="volume", Value=Requests, Baseline=round(baseline,1),
+              Score=round(score,2), Direction=iff(flags>0,"spike","drop")
+}
+
+// Anomalie poziomu błędów jako wiersze.
+.create-or-alter function with (folder="anomaly") ErrorRateAnomalies(lookback:timespan = 1h, step:timespan = 1m, sensitivity:real = 1.5) {
+    AppRequests
+    | where Timestamp > ago(lookback)
+    | extend IsError = iff(Success == false or toint(ResultCode) >= 500, 1, 0)
+    | make-series Errors = sum(ItemCount * IsError) default=0,
+                  Total  = sum(ItemCount)           default=0 on Timestamp step step
+    | extend ErrorRate = series_divide(Errors, Total)
+    | extend (flags, score, baseline) = series_decompose_anomalies(ErrorRate, sensitivity, -1, 'linefit')
+    | mv-expand Timestamp to typeof(datetime), ErrorRate to typeof(real),
+                flags to typeof(int), score to typeof(real), baseline to typeof(real)
+    | where flags > 0
+    | project Timestamp, Metric="error_rate", Value=round(ErrorRate,3), Baseline=round(baseline,3),
+              Score=round(score,2), Direction="spike"
+}
+
+// Anomalie latencji p95 jako wiersze.
+.create-or-alter function with (folder="anomaly") LatencyAnomalies(lookback:timespan = 1h, step:timespan = 1m, sensitivity:real = 1.5) {
+    AppRequests
+    | where Timestamp > ago(lookback)
+    | make-series P95 = percentile(DurationMs, 95) default=0 on Timestamp step step
+    | extend (flags, score, baseline) = series_decompose_anomalies(P95, sensitivity, -1, 'linefit')
+    | mv-expand Timestamp to typeof(datetime), P95 to typeof(real),
+                flags to typeof(int), score to typeof(real), baseline to typeof(real)
+    | where flags > 0
+    | project Timestamp, Metric="latency_p95_ms", Value=round(P95,1), Baseline=round(baseline,1),
+              Score=round(score,2), Direction="spike"
+}
+
+// Zbiorcza lista najświeższych anomalii (źródło dla alertu Activator i tabeli na dashboardzie).
+.create-or-alter function with (folder="anomaly") RecentAnomalies(lookback:timespan = 1h) {
+    union
+        (VolumeAnomalies(lookback)),
+        (ErrorRateAnomalies(lookback)),
+        (LatencyAnomalies(lookback))
+    | order by Timestamp desc
+}
+
+// Przykład użycia po utworzeniu funkcji:
+//   RecentAnomalies(2h)
+//   VolumeAnomalies(3h, 1m, 1.2)

@@ -1,0 +1,116 @@
+// =============================================================================
+// 01 - Eventhouse (KQL DB) schema dla demo Fabric Anomaly Detection
+// =============================================================================
+// Uruchom w KQL queryset podłączonym do bazy KQL w Eventhouse.
+// Model: surowy envelope z Event Hub (diagnostic export) -> tabela RawTelemetry,
+// a update policy parsuje rekordy AppRequests do typowanej tabeli AppRequests.
+//
+// Envelope z Azure Monitor diagnostic settings ma postać: { "records": [ {...}, ... ] }
+// Każdy rekord AppRequests zawiera m.in. pola: time, AppRoleName, OperationName,
+// Name, Url, ResultCode, Success, DurationMs, ItemCount, OperationId, category.
+// (ItemCount > 1 oznacza sampling - sumujemy go, by mieć poprawny wolumen.)
+// =============================================================================
+
+// --- Tabela surowa: cel dla destynacji Eventstream (kolumna z całym envelope) ---
+.create table RawTelemetry (records: dynamic)
+
+// Mapping: weź tablicę "records" z body wiadomości Event Hub.
+.create table RawTelemetry ingestion json mapping "rawMapping"
+```
+[
+  {"column":"records","Properties":{"Path":"$.records"}}
+]
+```
+
+// --- Tabela docelowa: typowane żądania ---
+.create table AppRequests (
+    Timestamp:    datetime,
+    AppRoleName:  string,
+    OperationName:string,
+    Name:         string,
+    Url:          string,
+    ResultCode:   string,
+    Success:      bool,
+    DurationMs:   real,
+    ItemCount:    int,
+    OperationId:  string
+)
+
+// --- Funkcja parsująca (rozwija records[] i filtruje kategorię AppRequests) ---
+.create-or-alter function ExpandAppRequests() {
+    RawTelemetry
+    | mv-expand rec = records
+    | where tostring(rec.category) == "AppRequests"
+    | project
+        Timestamp    = todatetime(rec.time),
+        AppRoleName  = tostring(rec.AppRoleName),
+        OperationName= tostring(rec.OperationName),
+        Name         = tostring(rec.Name),
+        Url          = tostring(rec.Url),
+        ResultCode   = tostring(rec.ResultCode),
+        Success      = tobool(rec.Success),
+        DurationMs   = toreal(rec.DurationMs),
+        ItemCount    = toint(coalesce(rec.ItemCount, 1)),
+        OperationId  = tostring(rec.OperationId)
+}
+
+// --- Update policy: automatyczne parsowanie przy każdym ingest do RawTelemetry ---
+.alter table AppRequests policy update
+```
+[
+  {
+    "IsEnabled": true,
+    "Source": "RawTelemetry",
+    "Query": "ExpandAppRequests()",
+    "IsTransactional": false,
+    "PropagateIngestionProperties": false
+  }
+]
+```
+
+// --- Retencja: RawTelemetry krótka (dane już sparsowane), AppRequests dłuższa ---
+.alter table RawTelemetry policy retention softdelete = 1d
+.alter table AppRequests   policy retention softdelete = 30d
+
+// =============================================================================
+// Agregacja minutowa dla wbudowanego Anomaly Detector (Real-Time Intelligence)
+// -----------------------------------------------------------------------------
+// Wbudowany Anomaly Detector wymaga tabeli o schemacie: kolumna LICZBOWA
+// (Value to watch) + kolumna DATETIME (Timestamp) + kolumna STRING (Group by).
+// AppRequests spełnia to dla latencji (DurationMs / OperationName), ale anomalie
+// WOLUMENU wymagają zliczeń na minutę -> tworzymy materialized view.
+// Materialized view aktualizuje się automatycznie wraz z napływem danych, więc
+// re-analiza modelu "na nowych danych" działa od razu na świeżych agregatach.
+// =============================================================================
+.create materialized-view with (backfill=true) TrafficPerMinute on table AppRequests
+{
+    AppRequests
+    | summarize
+        Requests      = sum(ItemCount),
+        Errors        = sumif(ItemCount, Success == false or toint(ResultCode) >= 500),
+        AvgDurationMs = avg(DurationMs),
+        MaxDurationMs = max(DurationMs)
+      by Timestamp = bin(Timestamp, 1m), OperationName
+}
+
+// (Opcjonalnie) widok zbiorczy bez podziału na endpoint - jeden szereg "całego ruchu".
+.create materialized-view with (backfill=true) TrafficTotalPerMinute on table AppRequests
+{
+    AppRequests
+    | summarize
+        Requests      = sum(ItemCount),
+        Errors        = sumif(ItemCount, Success == false or toint(ResultCode) >= 500),
+        AvgDurationMs = avg(DurationMs)
+      by Timestamp = bin(Timestamp, 1m), Service = AppRoleName
+}
+
+// =============================================================================
+// Szybki test po podłączeniu Eventstream + uruchomieniu generatora ruchu:
+//   AppRequests       | take 20
+//   AppRequests       | summarize count() by bin(Timestamp, 1m) | render timechart
+//   TrafficPerMinute  | order by Timestamp desc | take 20
+//
+// Po tym przejdź do fabric/07_anomaly_detector.md - tam konfiguracja wbudowanego
+// Anomaly Detectora (Value to watch = Requests, Group by = OperationName,
+// Timestamp = Timestamp na tabeli TrafficPerMinute).
+// =============================================================================
